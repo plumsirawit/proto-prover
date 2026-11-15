@@ -106,6 +106,42 @@ The neural result shows that the latent can choose the route, while the rules
 handle the proof details that previously caused type mismatches. The per-goal
 results are under `$SCRATCH/proto-prover/2000-20981242/results`.
 
+### Plain goal-to-proof Transformer
+
+Slurm job `21016530` reads the same archived 2,000-goal dataset. The model is
+a four-layer causal Transformer of width 128 with 582,219 parameters. It
+trains on `[goal tokens] [proof tokens]`, with next-token loss on the proof
+portion only. At evaluation it receives the theorem and hypotheses, then
+generates one greedy proof. It has no proof encoder, reference-proof input,
+strategy label, or expression tree. Checkpoints are selected by validation
+cross-entropy before either test split is decoded.
+
+The model trained on all four references per goal solved **219/240** (91.25%)
+on unseen expression templates and **224/240** on fresh goals using familiar
+templates. All accepted proofs used gap witnesses. Of the 219 accepted outputs
+on unseen templates, 216 exactly matched a reference at token level. Most of
+the 21 rejected outputs had a parser error involving an unclosed expression.
+
+| Training targets | Training goals | New goals, familiar templates | Unseen templates |
+| --- | ---: | ---: | ---: |
+| All four scripts | 1,231/1,280 | 224/240 | 219/240 |
+| Canonical monotonicity only | 103/1,280 | 0/240 | 1/240 |
+
+These rows use checkpoints selected on validation loss (steps 500 and 200,
+respectively). The final step-1,000 checkpoints solved 1,256/1,280 and
+1,103/1,280 training goals, respectively. In the validation-selected
+monotonicity run, 114 held-out outputs produced type mismatches. The decoder
+often emitted the right kind of lemma with the wrong nesting or hypotheses.
+
+Slurm job `21017402` scored both saved final checkpoints on the same 240 goals.
+The mixed model reached **231/240** (96.25%), all with gap witnesses. The
+monotonicity-only model scored **0/240**. This diagnostic uses the fixed final
+step for both models. Gap witnesses let `omega` handle the sum after rewriting,
+while the direct monotonicity proof must assemble a term for the exact goal
+tree. Both runs used 8 CPUs and 24 GiB. The per-goal files and checkpoints are
+under `$SCRATCH/proto-prover` in run directories `2000-21016530` and
+`2000-21017402`.
+
 ### Runs
 
 Slurm jobs `20951137`, `20951328`, `20951422`, and `20951798` all completed.

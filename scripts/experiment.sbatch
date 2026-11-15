@@ -18,6 +18,9 @@ module=latent_prover.experiment
 if [[ ${1:-} == --structured ]]; then
     module=latent_prover.structured
     shift
+elif [[ ${1:-} == --goal-to-proof ]]; then
+    module=latent_prover.goal_to_proof
+    shift
 fi
 
 memory_mib=$(( SLURM_MEM_PER_CPU * SLURM_CPUS_PER_TASK ))

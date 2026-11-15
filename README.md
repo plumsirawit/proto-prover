@@ -66,3 +66,21 @@ Lean exports the elaborated goal and local inequality hypotheses. The planner
 decomposes addition and finds paths through those hypotheses. It renders the
 path either as monotonicity or as additive gap witnesses. The comparison saves
 both decoders' verdicts and a control that tries both plans without a latent.
+
+To run the plain goal-to-proof Transformer on the same archived split, pass
+the original dataset file. The input sequence contains the goal tokens followed
+by proof tokens. The loss scores only the proof tokens. At evaluation the model
+starts with the goal and greedily emits one proof, which Lean checks.
+
+```bash
+sbatch --output="$run_root/slurm-%j.log" scripts/experiment.sbatch \
+  "$PWD" "$run_root" "$python_exe" "$lean_exe" 2000 \
+  --goal-to-proof --dataset "$run_root/2000-20951422/results/dataset.jsonl"
+```
+
+The default compares training on all four proof scripts per goal with training
+on one canonical monotonicity proof per goal. Checkpoints and per-goal results
+are saved on scratch. The summary includes Lean acceptance on training goals,
+new goals from familiar templates, and the 240 held-out template goals.
+Pass `--checkpoint-run` with the results directory of a completed run to score
+its final checkpoints on the held-out split without retraining.
