@@ -50,3 +50,19 @@ for the stricter result that requires both renderings of each strategy to work.
 `--seed`, `--steps`, `--width`, `--latent-slots`, and `--latent-dim` can be set
 independently. `--transfer` also tests latents taken from a different goal and
 expression template. The script stages no large files in the repository.
+
+To compare the expression-tree decoder against an archived width-128
+contrastive run, point to that run's trusted results directory. The comparison
+uses its dataset and checkpoint, retrains only a linear route selector, and
+replays the original decoder on the same 240 test goals.
+
+```bash
+sbatch --output="$run_root/slurm-%j.log" scripts/experiment.sbatch \
+  "$PWD" "$run_root" "$python_exe" "$lean_exe" 2000 \
+  --structured --baseline "$run_root/2000-20951422/results"
+```
+
+Lean exports the elaborated goal and local inequality hypotheses. The planner
+decomposes addition and finds paths through those hypotheses. It renders the
+path either as monotonicity or as additive gap witnesses. The comparison saves
+both decoders' verdicts and a control that tries both plans without a latent.

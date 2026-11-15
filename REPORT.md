@@ -77,6 +77,35 @@ original training set end to end. This check leaves the held-out template
 generalization result unchanged. The per-script results are in
 `$SCRATCH/proto-prover/24-20958707/results/reconstruction-train-encoded.json`.
 
+### Expression-tree decoder
+
+Slurm job `20981242` replayed the original width-128 contrastive checkpoint
+(step 200 of `20951422`) on the archived dataset. The two decoders received
+the same 960 reference-proof inputs and corresponding frozen encoder latents
+for the same 240 held-out goals. The token replay reproduced every archived
+output and verdict.
+
+The tree decoder uses a linear head fitted on the original training latents
+to choose one of the two strategies. Lean exports the elaborated goal and its
+inequality hypotheses. The planner recursively aligns addition nodes and
+uses reflexivity or a path through local inequalities at each leaf. A fixed
+renderer turns that plan into a `Nat.add_le_add` term or a gap-witness proof.
+For `((1 + a0) + a1) ≤ ((1 + b0) + b1)`, the tree now puts reflexivity on
+the first operand, then uses `h0` and `h1` in the positions Lean expects.
+
+| Decoder | Lean accepted | Monotonicity | Gap witnesses | Both routes on a goal |
+| --- | ---: | ---: | ---: | ---: |
+| Original token decoder | 456/960 | 0/480 | 456/480 | 0/240 |
+| Tree decoder with learned route selector | 960/960 | 480/480 | 480/480 | 240/240 |
+| Tree planner trying both routes from the goal alone | 480/480 | 240/240 | 240/240 | 240/240 |
+
+The learned selector chose the correct route for all 960 inputs. The symbolic
+control constructs one proof per route per goal and needs no reference proof
+or latent. Its result shows that the fixed rules cover this synthetic benchmark.
+The neural result shows that the latent can choose the route, while the rules
+handle the proof details that previously caused type mismatches. The per-goal
+results are under `$SCRATCH/proto-prover/2000-20981242/results`.
+
 ### Runs
 
 Slurm jobs `20951137`, `20951328`, `20951422`, and `20951798` all completed.
