@@ -76,7 +76,7 @@ def objective(model, goal, proofs, mode, weight):
     return loss, reconstruction
 
 
-def train(args, mode, config, train_rows, dev_rows, directory, vocabulary):
+def train(args, mode, config, train_rows, selection_rows, directory, vocabulary):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     model = ProofModel(config)
@@ -84,6 +84,7 @@ def train(args, mode, config, train_rows, dev_rows, directory, vocabulary):
     history = []
     best, best_step = math.inf, 0
     order = list(train_rows)
+    selection_metric = "train_eval_ce" if args.overfit_train else "dev_ce"
     step = 0
     start = perf_counter()
     while step < args.steps:
@@ -100,17 +101,22 @@ def train(args, mode, config, train_rows, dev_rows, directory, vocabulary):
             if step in (1, args.steps) or step % args.validate_every == 0:
                 model.eval()
                 with torch.no_grad():
-                    dev_losses = []
-                    for dev_batch in batches(dev_rows, args.batch_goals):
-                        _, dev_loss = objective(model, *collate(dev_batch), mode, args.contrastive_weight)
-                        dev_losses.append((len(dev_batch), dev_loss.item()))
-                    dev = sum(count * value for count, value in dev_losses) / len(dev_rows)
+                    selection_losses = []
+                    for selection_batch in batches(selection_rows, args.batch_goals):
+                        selection_goal, selection_proof = collate(selection_batch)
+                        _, selection_loss = objective(model, selection_goal, selection_proof,
+                                                      mode, args.contrastive_weight)
+                        weight = (int(selection_proof[:, 1:].ne(PAD).sum()) if args.overfit_train
+                                  else len(selection_batch))
+                        selection_losses.append((weight, selection_loss.item()))
+                    selection_ce = (sum(weight * value for weight, value in selection_losses)
+                                    / sum(weight for weight, _ in selection_losses))
                 row = {"step": step, "loss": loss.item(), "training_ce": reconstruction.item(),
-                       "dev_ce": dev, "elapsed_s": round(perf_counter() - start, 2)}
+                       selection_metric: selection_ce, "elapsed_s": round(perf_counter() - start, 2)}
                 history.append(row)
                 print(mode, row, flush=True)
-                if dev < best:
-                    best, best_step = dev, step
+                if selection_ce < best:
+                    best, best_step = selection_ce, step
                     torch.save({"config": asdict(config), "vocabulary": vocabulary.items,
                                 "mode": mode, "step": step, "state": model.state_dict()},
                                directory / f"{mode}.pt")
@@ -119,7 +125,8 @@ def train(args, mode, config, train_rows, dev_rows, directory, vocabulary):
     checkpoint = torch.load(directory / f"{mode}.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["state"])
     model.eval()
-    return model, {"best_step": best_step, "model_parameters": sum(p.numel() for p in model.parameters()),
+    return model, {"best_step": best_step, "checkpoint_selection": selection_metric,
+                   "model_parameters": sum(p.numel() for p in model.parameters()),
                    "training_s": round(perf_counter() - start, 2), "history": history}
 
 
@@ -181,6 +188,10 @@ def evaluate(args, model, vocabulary, goals, examples, mode, condition):
                 rows.append({"goal_id": spec.id, "family": spec.family, "expected": STRATEGIES[index // 2],
                              "latent_source_goal_id": source,
                              "rendering": index % 2, "proof": proof})
+                if args.overfit_train:
+                    reference = spec.proofs[index]
+                    rows[-1]["reference"] = reference
+                    rows[-1]["exact_token_match"] = proof is not None and tokens(proof) == tokens(reference)
                 cases.append((spec.statement, proof or ""))
     generation_s = perf_counter() - start
     verdicts = check(args.lean, args.output, cases, args.verify_workers)
@@ -192,6 +203,8 @@ def evaluate(args, model, vocabulary, goals, examples, mode, condition):
         if row["proof"] is None:
             row["status"] = "no_eos"
     result = score(rows)
+    if args.overfit_train:
+        result["exact_token_matches"] = sum(row["exact_token_match"] for row in rows)
     result["decode_s"] = round(generation_s, 2)
     result["verify_s"] = round(perf_counter() - start - generation_s, 2)
     if positive:
@@ -227,6 +240,8 @@ def parser():
     p.add_argument("--verify-workers", type=int, default=4)
     p.add_argument("--modes", nargs="+", choices=MODES, default=DEFAULT_MODES)
     p.add_argument("--transfer", action="store_true", help="Also swap latents across test templates.")
+    p.add_argument("--overfit-train", action="store_true",
+                   help="Run plain autoencoding with checkpoint selection and greedy decoding on training goals.")
     p.add_argument("--allow-local", action="store_true", help="Allow development outside Slurm.")
     return p
 
@@ -234,6 +249,8 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    if args.overfit_train:
+        args.modes = ("reconstruction",)
     if not args.allow_local and not os.environ.get("SLURM_JOB_ID"):
         p.error("Training requires a Slurm allocation (--allow-local for local development).")
     limit = int(os.environ.get("SLURM_CPUS_PER_TASK", str(len(os.sched_getaffinity(0)))))
@@ -248,6 +265,8 @@ def main():
     torch.set_num_interop_threads(1)
     start = perf_counter()
     goals = generate(args.size)
+    if args.overfit_train:
+        goals = [g for g in goals if g.split == "train"]
     split_counts = write_dataset(args.output / "dataset.jsonl", goals)
     references = [(g.statement, proof) for g in goals for proof in g.proofs]
     reference_batch = min(96, max(24, len(references) // args.verify_workers))
@@ -276,10 +295,12 @@ def main():
                "reference_proofs_verified": len(references), "reference_verify_s": verify_references_s,
                "model": asdict(config), "runs": {}}
     for mode in args.modes:
-        model, metrics = train(args, mode, config, encoded["train"], encoded["dev"], args.output, vocabulary)
+        selection_split = "train" if args.overfit_train else "dev"
+        model, metrics = train(args, mode, config, encoded["train"], encoded[selection_split],
+                               args.output, vocabulary)
         state = metrics | {"evaluation": {}}
         summary["runs"][mode] = state
-        for split in ("seen", "test"):
+        for split in ("train",) if args.overfit_train else ("seen", "test"):
             evals = state["evaluation"][split] = {}
             conditions = ["encoded"]
             if mode == "strategy":

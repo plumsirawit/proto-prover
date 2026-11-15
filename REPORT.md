@@ -60,6 +60,23 @@ or an oracle label. A useful next experiment is to give the decoder the Lean
 expression tree and let it assemble a checkable proof plan. The persistent
 failure with oracle labels makes that a more direct test of the observed problem.
 
+### Training-set sanity check
+
+The overfit run uses the 16 training goals from the 24-goal pilot and their
+64 proof scripts. It trains the width-128 plain autoencoder for 1,000 updates
+and picks the checkpoint by token cross-entropy over the full training set.
+It then greedily decodes each script from its latent and the corresponding goal,
+starting with an empty proof prefix. Exact match compares tokens and line
+breaks, ignoring spacing between tokens. Lean acceptance is measured separately.
+To reproduce, run the same Slurm script with `24 --overfit-train --steps 1000`.
+
+Slurm job `20958707` selected the step-1,000 checkpoint at a training
+cross-entropy of 0.000277 per token. Greedy decoding gave **64/64 exact matches**
+and **64/64 Lean-accepted proofs**. The plain autoencoder can reconstruct the
+original training set end to end. This check leaves the held-out template
+generalization result unchanged. The per-script results are in
+`$SCRATCH/proto-prover/24-20958707/results/reconstruction-train-encoded.json`.
+
 ### Runs
 
 Slurm jobs `20951137`, `20951328`, `20951422`, and `20951798` all completed.
