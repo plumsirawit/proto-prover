@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -13,6 +14,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
@@ -38,6 +40,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -56,6 +59,7 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        return x
 
 @dataclass
 class GPTConfig:
@@ -77,6 +81,18 @@ class GPT(nn.Module):
             "ln_f": nn.LayerNorm(config.n_embd)
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -121,7 +137,7 @@ class GPT(nn.Module):
 
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -132,12 +148,73 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+import tiktoken
+import pandas as pd
+BY_SORRY = (98, 121, 32, 115, 111, 114, 114, 121, 0)
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        self.problems = pd.read_parquet('../../data/numinamath-lean/problems.parquet')
+        self.proofs = pd.read_parquet('../../data/numinamath-lean/proofs.parquet')
+        N = len(self.problems)
+        self.problems.insert(len(self.problems.columns), 'encoded_statement', [tuple()]*N)
+        for i in range(N):
+            self.problems.at[i, 'encoded_statement'] = tuple(list(self.problems.at[i, 'formal_statement'].strip().encode("utf-8")) + [0])
+            assert self.problems.at[i, 'encoded_statement'][-9:] == BY_SORRY
+        self.problems = self.problems.set_index('id')
+        print(f"loaded {N} problems")
+        M = len(self.proofs)
+        self.proofs.insert(len(self.proofs.columns), 'encoded_proof', [tuple()]*M)
+        for i in range(M):
+            encoded_proof = tuple(list(self.proofs.at[i, 'formal_proof'].encode("utf-8")) + [0])
+            buf_id = self.proofs.at[i, 'problem_id']
+            stmt = self.problems.loc[buf_id]['encoded_statement']
+            self.proofs.at[i, 'encoded_proof'] = stmt[:-9] + encoded_proof
+        print(f"loaded {M} proofs")
+        self.current_row = 0
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        proof = self.proofs.at[self.current_row, 'encoded_proof']
+        if self.current_position > len(proof):
+            self.current_position = 0
+            self.current_row += 1
+            proof = self.proofs.at[self.current_row, 'encoded_proof']
+        buf = proof[self.current_position : self.current_position+B*T+1]
+        buf = buf + (0,) * (B*T+1 - len(buf))
+        buf = torch.tensor(buf)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+        return x, y
+
+dl = DataLoaderLite(5, 32)
 
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('xpu')
-print("didn't crash yay!")
+device = 'xpu'
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+model.to(device)
+
+torch.manual_seed(1337)
+if torch.xpu.is_available():
+    torch.xpu.manual_seed(1337)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = dl.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
