@@ -3,6 +3,7 @@ Educational Project: GPT-2 reproduction, following Andrej Karparthy's video http
 """
 
 from dataclasses import dataclass
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -26,10 +27,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -153,7 +155,18 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-import tiktoken
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.ndim >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.ndim < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        fused_available = hasattr(torch.optim, 'FusedAdam')
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
+        return optimizer
+
 import pandas as pd
 BY_SORRY = (98, 121, 32, 115, 111, 114, 114, 121, 0)
 class DataLoaderLite:
@@ -195,26 +208,52 @@ class DataLoaderLite:
         self.current_position += B * T
         return x, y
 
-dl = DataLoaderLite(5, 32)
-
 num_return_sequences = 5
 max_length = 30
 
 device = 'xpu'
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=256))
 model.to(device)
+model = torch.compile(model)
 
 torch.manual_seed(1337)
 if torch.xpu.is_available():
     torch.xpu.manual_seed(1337)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+torch.set_float32_matmul_precision('high')
+
+dl = DataLoaderLite(8, 1024)
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for i in range(50):
+    t0 = time.time()
     x, y = dl.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.xpu.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)*1000
+    print(f"step {i}, loss: {loss.item()}, norm: {norm.item():.4f}, time: {dt:.2f} ms")
